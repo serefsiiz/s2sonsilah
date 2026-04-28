@@ -1,0 +1,12 @@
+{
+  "name": "s2_lobby_server",
+  "version": "1.0.0",
+  "description": "S2: Son Silah - Lobby Server (port 13000)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "uuid": "^9.0.1"
+  }
+}

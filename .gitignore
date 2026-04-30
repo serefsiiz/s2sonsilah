@@ -1,6 +1,48 @@
-node_modules/
-*.log
-*.bak
-*.tmp
-.DS_Store
+# node_modules — her klasör için
+**/node_modules/
+**/package-lock.json
+
+# Game client (5GB binary'ler ve assets)
+client/
+
+# Eski versiyonlar (artık kullanılmıyor)
+lobby\ server/
+s2server/
+
+# Runtime state — kullanıcı hesapları, envanter, session geçici dosyaları
 _session/
+
+# x64dbg debugger binary'leri (zip + .exe + .dll)
+_x64dbg_mcp_v2/proxy/
+_x64dbg_mcp_v2/x32_plugin/
+_x64dbg_mcp_v2/*.zip
+
+# MITM capture log'ları (büyük + dynamic, hesap şifresi içerebilir)
+mitm_capture.txt
+mitm_capture_full.txt
+mitm_capture*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Log + temp
+*.log
+*.tmp
+tmp/
+
+# Build artifacts
+dist/
+build/
+out/
+
+# Local env
+.env
+.env.local
+
+# Backup files
+*.bak
+*.dll.bak

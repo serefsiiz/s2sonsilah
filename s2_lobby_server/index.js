@@ -72,6 +72,8 @@ const PKT = {
     CQ_Room_EnterUser           : 2228785,    // 0x220231 (eskiden 0x220311 yanlıştı)
     CQ_Room_LeaveUser           : 2228788,    // 0x220234 (eskiden 2228789 yanlıştı — SA ile çakışıyordu)
     NN_Chat_NotBattleAll        : 2229509,    // 0x220505 — oda/lobby chat (iki yönlü)
+    NN_Chat_BattleAll           : 0x220509,    // in-game (mid-match) chat — payload: virtualIndex u16 + chat msg + state floats
+    NN_Chat_BattleTeam          : 0x220507,    // in-game (mid-match) team-chat — same format as BattleAll
     // CQ_Room_Change* — IDA builder reverse'inden KESİN doğru opcode'lar
     // (sub_1013B330 vd.; eski +1 değerler client'ta tanımsızdı, log'da unknown).
     CQ_Room_ChangeBoundary      : 0x220211,    // 30 byte payload (1 byte data)
@@ -88,22 +90,90 @@ const PKT = {
     SA_Team_Exchange            : 0x220315,
     SN_Team_Exchange            : 0x220316,
     CN_Chat_DevCommand          : 0x220522,    // dispatcher: tPacket_NMatchup_NChat_CN_DevCommand (CN, cevapsız)
-    CQ_TheRawServer_Connect     : 0x410101,    // dedicated handshake
-    CN_TheRawServer_Notify      : 0x420208,    // dedi → lobby notify (client-add yetkilendirme tahmini)
-    CN_TheRawServer_UserRemoved : 0x420205,    // dedi → lobby: user X dedi'den disconnect oldu
-                                                //   (sub_10085520 reverse: 18 byte, payload[0..1]=virtualUserIndex,
-                                                //   sonra sub_10084F50 ile expected list'ten çıkarıyor)
-    CN_TheRawServer_ClientAdded : 0x420105,    // dedi → lobby: client X başarıyla bağlandı (CheckConnectComplete)
-    // 0x230151: GameServer.dll sub_100CC2E0 = "SendHermitRoundStart" string'iyle
-    // teyit. Dedi state machine state 3 → 4 (Playing) geçişinde 20 byte (16 header
-    // + 4 byte zero payload) yolluyor. Lobby tarafında ECHO yerine, bu opcode'a
-    // uygun cevap (henüz net değil — muhtemelen sessiz kabul, dedi state machine
-    // kendisi takip ediyor) verilmeli.
-    SN_RoundStart               : 0x230151,    // (eski "SN_Battle_Captin" ismi YANLIŞTI)
-    SN_Battle_Captin            : 0x230151,    // backward-compat alias
-    CN_TheRawServer_Ready1      : 0x420203,    // dedi → lobby: post-handshake notify (boş payload)
-    CN_TheRawServer_Ready2      : 0x420206,    // dedi → lobby: post-handshake notify (2 byte payload)
-    CN_TheRawServer_Ready3      : 0x420204,    // dedi → lobby: post-handshake notify (1 byte payload)
+    CQ_TheRawServer_Connect     : 0x410101,    // lobby ←dedi: handshake (43 byte: 27 byte payload — flag/port/IP/serverId)
+
+    // ============================================================
+    // dedi → lobby notification opcodes (deep reverse 2026-04-30)
+    // ============================================================
+    // 0x420203 — dedi → lobby. 16 byte (sadece header, payload yok).
+    //            Builder: GameServer.dll sub_100D1FA0 (`mov dword [ecx+0Ch], 420203h; mov [ecx+6], 16`)
+    //            Dedi handshake sonrası "ben hazırım" sinyali olarak ilk gelen.
+    SN_TheRawServer_HandshakeAck : 0x420203,
+
+    // 0x420205 — dedi → lobby. 18 byte (header + u16 virtualIndex payload).
+    //            Builder: 4 farklı yerde (0x10083655/3b32/8553d/85fc3) — user-state notify.
+    //            Canlı debug 2026-04-30: state=Playing achieved sinyali (sub_100D28C0
+    //            case 2294098 başarıyla tamamlandığında) virtualIndex ile.
+    //            Format: payload[0..1] u16 virtualIndex (LE).
+    SN_TheRawServer_StatePlaying : 0x420205,
+
+    // 0x420206 — dedi → lobby. 18 byte (header + u16 virtualIndex payload).
+    //            Builder: 0x10083685/3b52/847b1. Handshake sonrası 2. notify, virtualIndex ile.
+    //            Format: payload[0..1] u16 virtualIndex (LE).
+    SN_TheRawServer_HandshakeAck2 : 0x420206,
+
+    // 0x420208 — dedi → lobby. 18 byte (header + u16 virtualIndex payload).
+    //            Builder: sub_10083630 (`mov [eax+0Ch], 420208h; mov [eax+6], 18`).
+    //            "Notify" — generic per-user event, virtualIndex'le.
+    //            Format: payload[0..1] u16 virtualIndex (LE).
+    SN_TheRawServer_Notify       : 0x420208,
+
+    // 0x420202 — dedi → lobby. 24 byte. Builder: sub_100D1F80 ve allocator 0x100D2270.
+    //            Lobby'den gelen 0x420201'e cevap olarak gönderilir (sub_100D2810 handler).
+    //            Format: payload[0..1] u16 virtualIndex=0 + payload[2..5] u32 0
+    //                    + payload[6..7] u16 stockMgr field (offset 36).
+    SN_TheRawServer_ConnectAck   : 0x420202,
+
+    // 0x420209 — dedi → lobby. 18 byte. Builder: sub_100D1FE0 ve allocator 0x100D22C0.
+    SN_TheRawServer_Notify2      : 0x420209,
+
+    // ============================================================
+    // lobby → dedi command opcodes (sub_100D2810 dispatcher)
+    // ============================================================
+    // 0x420201 — lobby → dedi: "begin/connect" cmd. dedi 0x420202 ile cevap verir.
+    // 0x420207 — lobby → dedi: ?? cmd. Dedi user lookup yapar, başarılıysa "SN_NotExistUser" log.
+    // 0x420320 — lobby → dedi: "UserExit" cmd. Dedi user lookup yapar, başarılıysa "SN_UserExit" log.
+    CN_DEDI_UserExit             : 0x420320,
+
+    // ============================================================
+    // dedi engine → lobby: spawn task notify (DoRespawn)
+    // ============================================================
+    // 0x230103 — dedi → lobby. 19 byte. Builder: sub_100CC270 (DoRespawn).
+    //            Engine task queue'ya enqueue edildiğinde lobby'ye broadcast'lanıyor.
+    //            Format: payload[0..1] u16 virtualIndex (LE)
+    //                    payload[2]    u8  doRespawnFlag (DoRespawn 2. argümanı; 0 normal spawn)
+    //            Reverse (sub_100CC270 disasm onaylı): packet[0xC]=0x230103, packet[6]=19,
+    //            packet[0x10]=virtualIndex, packet[0x12]=flag.
+    SN_TheRawServer_DoRespawnTask : 0x230103,
+
+    // 0x230111 — dedi → lobby. 16 byte (sadece header, payload yok).
+    //            Builder: sub_100CBDC0 + 0x100CC012 + 0x100CC223 (sub_100CD7D0 içinde).
+    //            Reverse: sub_100CD7D0 — round bitiş state geçişi (state=5=EndingRound).
+    //            Non-host mode'da (`[global+108] != 1`) round bitince enqueue ediliyor.
+    //            "Host EServerGameState_EndingRound" debug string'i ile bağlantılı.
+    SN_TheRawServer_RoundEnd      : 0x230111,
+
+    // 0x230151 — dedi case 2294097 (sub_10058CC0) — per-user spawn handler.
+    //            Format: payload[0..1] u16 virtualIndex
+    SN_RoundStart                 : 0x230151,
+    SN_Battle_Captin              : 0x230151,    // backward-compat alias
+
+    // ----- D187 maç-içi opcode'lar (2026-04-30 MITM capture) -----
+    // DOĞRU isimler (kullanıcı düzeltmesi): bunlar GAME EVENT'leri, periodic heartbeat değil!
+    SN_Game_Revive                : 0x230104,    // SN_Revive — birinin revive olduğu notify
+    SN_Game_Kill                  : 0x230124,    // SN_Kill — kill bildirimi (her kill için 1 paket)
+    NN_Match_BattleTeamRadio      : 0x220510,    // takım radio chat (V-W-X tuşlarıyla bağırma)
+    CN_Play_Ping                  : 0x222141,    // Client→Server periodic ping (24B, 8B payload)
+    SA_Play_Ping                  : 0x222142,    // Server→Client ping ack (46B)
+    SN_Play_PingExtra             : 0x222143,    // Server→Client ping ack-2 (22B zeros)
+
+    // BACKWARD-COMPATIBILITY aliases (eski karışık isimler — yeni kod yukarıdaki
+    // doğru isimleri kullanmalı, eski case'ler lobby kodunda hala bunlara bakıyor).
+    CN_TheRawServer_Ready1        : 0x420203,    // = SN_TheRawServer_HandshakeAck
+    CN_TheRawServer_Ready2        : 0x420205,    // = SN_TheRawServer_StatePlaying (eski 0x420206 yanlıştı)
+    CN_TheRawServer_Ready3        : 0x420206,    // = SN_TheRawServer_HandshakeAck2 (eski 0x420204 yanlıştı)
+    CN_TheRawServer_Notify        : 0x420208,    // = SN_TheRawServer_Notify
+    CN_TheRawServer_ClientAdded   : 0x420105,    // ⚠ DEDI BINARY'DE BU OPCODE YOK — case fire etmiyor
     CQ_Heartbeat                : 0x20080,
     CQ_KeepAlive                : 0x20082,
     CQ_KeepAliveAck             : 0x20083,
@@ -163,6 +233,7 @@ const PKT = {
     SN_Play_BaseRoomInfo        : 2236689,    // 0x222111
     SN_Play_BaseUserList        : 2236690,    // 0x222112
     SN_Play_BattleInfo          : 2236692,    // 0x222114 — eski emülatörde createRoom akışında dahil
+    SN_Result_GameFinalResult   : 2236961,    // 0x222221 — match-end Result ekranı per-player 811 byte
     SN_Play_ReadyButtonFail     : 2236674,    // 0x222102
     SN_Play_StartButtonFail     : 2236676,    // 0x222104
     SN_Play_LocalKey            : 2236677,    // 0x222105
@@ -1047,47 +1118,73 @@ function buildBaseUserListPayload(room) {
     return p;
 }
 
-// SN_Play_BattleInfo (0x222114) — KRİTİK paket: MissionController initializer.
-// Reverse (sub_100CA860 — TAM PACKET a1, header dahil):
-//   a1+17     u8        user count          → payload[1]
-//   a1+49..72 6×u32     game rule params    → payload[33..56] (sub_1040FAF0)
-//                       (round/time/score/team — sub_103FCB20 globals'a yazılır)
-//   a1+73+    N×20 byte user entries        → payload[57..]
-//     entry+0..1   = userId u16 (sub_1018DC90 lookup)
-//     entry+6..7   = stat1 u16 (a1+79 first user → user[+96])
-//     entry+8..9   = stat2 u16 (a1+81 → user[+98])
-//     entry+10..11 = stat3 u16 (a1+83 → user[+100])
-//   Sonra: v8 = *(globalState+56)+48 = GameMode obj
-//          v9 = vtable[5](v8) = mission type (1/3/5/7/9/10)
-//          *((u32*)sub_103FCB20() + 153) = v9   → GameRule[+612]
+// SN_Play_BattleInfo (0x222114) — KRİTİK paket: MissionController + squad
+// finalizer. Bunu göndermeden squad list-render dispatcher (sub_1013DD80) doğru
+// player+96/98/100 flag'lerini bulamıyor → squad satırları boş kalıyor.
 //
-// GameRule[+612] = mission type → CMissionMgr OnEnterWorld switch bunu okuyup
-// doğru CMission'ı yaratıyor (1=DeathMatch, 3=Bomb, 5=Capture, 7=Rescue, 9=Captin).
-// Bu paketsiz +612 default 255 olarak kalıyor → default CMission base → entity'ler
-// için GetController() popup'ı atıyor.
+// Reverse — sub_100CA860 (full packet ptr a1, 16-byte header dahil; payload[N] = a1[16+N]):
+//   a1[17]      u8        entry count                      → payload[1]
+//   a1[49..72]  6 × u32   game rule params                 → payload[33..56]
+//                         sub_1040FAF0(arg1..arg6) — sub_103FCB20 globals'a yazılır
+//   a1[73..74]  u16       İLK entry'nin userId             → payload[57..58]
+//                         (parser İLK iter'da *(v4-3) = a1+73 = payload[57] okur)
+//   a1[79..]    N × 20    ENTRY — payload[63..] (v4 = a1+79, v4 += 10 her iter):
+//     entry[0..1]   u16  stat1 → player+96
+//     entry[2..3]   u16  stat2 → player+98
+//     entry[4..5]   u16  stat3 → player+100
+//     entry[6..13]  -    8 byte ?
+//     entry[14..15] u16  NEXT entry'nin userId (sonraki iter'da *(v4-3) buradan okur)
+//     entry[16..19] -    4 byte ?
+//
+//   Loop sonrası: v8 = *(globalState+56)+48 = GameMode obj
+//                 v9 = vtable[5](v8) = mission type (1/3/5/7/9/10)
+//                 GameRule[+612] = v9 → CMissionMgr OnEnterWorld doğru CMission'ı yaratır
+//                 (1=DeathMatch, 3=Bomb, 5=Capture, 7=Rescue, 9=Captin)
+//
+// player+96/98/100 globalState+48/49/50 (team1Id/team2Id/team3Id) ile aynı offset →
+// "bu kullanıcı için team1Id-match / team2Id-match / team3Id-match" flag'leri.
+// Squad render bu değerleri okuyup A/B/spec slot'una yerleştirir.
 function buildBattleInfoPayload(room) {
     const p = Buffer.alloc(512);
     p.fill(0);
 
-    p[1] = Math.min(room.players.size, 16);   // user count
+    const players = [...room.players.values()];
+    const n = Math.min(players.length, 16);
+    p[1] = n;
 
-    // 6 game rule params @ payload[33..56] — sub_1040FAF0(round, time, score, team, ...)
-    p.writeUInt32LE(room.roundCount || 10,  33);   // round count
-    p.writeUInt32LE(room.timeLimit  || 180, 37);   // time limit (sec)
-    p.writeUInt32LE(room.scoreLimit || 100, 41);   // score limit
-    p.writeUInt32LE(room.missionType || 1,  45);   // mission type hint
-    p.writeUInt32LE(room.ruleIndex  || 3006,49);   // Map.csv rule index
-    p.writeUInt32LE(room.mapId      || 10006,53);  // Map.csv index
+    // 6 game rule params @ payload[33..56] — sub_1040FAF0
+    p.writeUInt32LE(room.roundCount || 10,   33);
+    p.writeUInt32LE(room.timeLimit  || 180,  37);
+    p.writeUInt32LE(room.scoreLimit || 100,  41);
+    p.writeUInt32LE(room.missionType || 1,   45);
+    p.writeUInt32LE(room.ruleIndex  || 3006, 49);
+    p.writeUInt32LE(room.mapId      || 10006, 53);
 
-    // User entries — her biri 20 byte, payload[57]'den başlıyor.
-    let off = 57;
-    for (const [, pl] of room.players) {
+    // İLK entry'nin userId @ payload[57..58]
+    if (n >= 1) {
+        const firstC = clients.get(players[0].socket);
+        if (firstC) p.writeUInt16LE(firstC.userId & 0xFFFF, 57);
+    }
+
+    // Entries başlangıcı payload[63] (NOT 57!). Her entry 20 byte.
+    let off = 63;
+    for (let i = 0; i < n; i++) {
+        const pl = players[i];
         const c = clients.get(pl.socket);
-        if (!c) continue;
-        p.writeUInt16LE(c.userId & 0xFFFF, off + 0);   // userId
-        p.writeUInt16LE(pl.team || 1,      off + 6);   // stat1 (team?)
-        p.writeUInt16LE(0,                 off + 8);   // stat2
-        p.writeUInt16LE(0,                 off + 10);  // stat3
+        if (!c) { off += 20; continue; }
+
+        // stat1/2/3 → player+96/98/100 (team1Id/team2Id/team3Id matching).
+        // BaseRoomInfo'da team1=1, team2=2, team3=0 kullandığımız için bu sıraya uyduruyoruz.
+        p.writeUInt16LE(1, off + 0);   // stat1 = team1Id
+        p.writeUInt16LE(2, off + 2);   // stat2 = team2Id
+        p.writeUInt16LE(0, off + 4);   // stat3 = team3Id
+
+        // SONRAKI entry'nin userId — bu entry'nin son kuyruğunda (offset 14..15)
+        if (i + 1 < n) {
+            const nextC = clients.get(players[i + 1].socket);
+            if (nextC) p.writeUInt16LE(nextC.userId & 0xFFFF, off + 14);
+        }
+
         off += 20;
         if (off + 20 > p.length) break;
     }
@@ -1097,6 +1194,77 @@ function buildBattleInfoPayload(room) {
 
 async function send_SN_Play_BattleInfo(socket, ctx, room) {
     await sendPacket(socket, ctx, PKT.SN_Play_BattleInfo, buildBattleInfoPayload(room));
+}
+
+// SN_Result_GameFinalResult (0x222221) — TEK PAKET / TÜM OYUNCULAR (8'e kadar).
+//
+// 🔬 PROBE TEST DOĞRULADI (Blue=4444 ✓ payload[10], Red=5555 ✓ payload[22]):
+//   Parser sub_10158A60 → qmemcpy(entry, packet, 811) — packet HAM (16 byte header dahil)
+//   entry[N] = packet[N] = payload[N - 16]
+//
+// 811-byte entry struct format (sub_10159840'tan reverse):
+//   entry[0..49]   = TEAM TOPLAM SCORE bölümü (Blue/Red wKill/wGoal/wScore)
+//   entry[50]      = SUB-ENTRY COUNT (0..8)         ← ZORUNLU, bu olmadan loop dönmez
+//   entry[51..]    = N × 95 byte PLAYER SUB-ENTRY   ← her oyuncu için 1
+//   50 + 1 + 8 × 95 = 811 ✓
+//
+// Payload (16-byte header shift):
+//   payload[10..11]  = entry[26..27] = wScore Blue (TEAM toplam)
+//   payload[22..23]  = entry[38..39] = wScore Red  (TEAM toplam)
+//   payload[34]      = entry[50]     = sub-entry count
+//   payload[35 + i*95 + ...]         = sub-entry i (95 byte/player)
+//
+// 95-byte SUB-ENTRY layout (sub_10159840 v75 erişimleri):
+//   sub[0..1]    u16  userId  ← sub_10070AA0(*v75) lookup, başarısızsa entry SKIP
+//   sub[2]       u8   stat byte (kill)
+//   sub[3]       u8   stat byte (death)
+//   sub[5]       u8   stat byte (point)
+//   sub[16..19]  u32  skill1 dword (wide-string convert input)
+//   sub[28..29]  u16  data
+//   sub[30..33]  u32  skill2 dword
+//   sub[38..53]  8×u16  per-round score pairs (mapping karmaşık, şimdilik sıfır)
+function buildGameFinalResultPayload(room, opts = {}) {
+    const p = Buffer.alloc(811);
+    p.fill(0);
+
+    const players = [...room.players.values()];
+    const n = Math.min(players.length, 8);
+
+    // ──────── TEAM TOPLAM SCORE (entry[0..49] = payload[-16..33], header'la çakışan kısım atılır) ────────
+    // Sadece okunabilen alanlar (entry >= 16 → payload >= 0):
+    p.writeUInt16LE(opts.blueScore ?? 0, 10);   // entry[26..27] = wScore Blue
+    p.writeUInt16LE(opts.redScore  ?? 0, 22);   // entry[38..39] = wScore Red
+
+    // ──────── SUB-ENTRY COUNT (entry[50] = payload[34]) ────────
+    p[34] = n;
+
+    // ──────── PER-PLAYER SUB-ENTRY (95 byte each) ────────
+    for (let i = 0; i < n; i++) {
+        const pl = players[i];
+        const c = clients.get(pl.socket);
+        if (!c) continue;
+        const subOff = 35 + i * 95;   // entry[51 + i*95] = payload[35 + i*95]
+        const stat = opts.playerStats?.[c.userId] || {
+            kill:  pl.team === 1 ? 5 : 3,
+            death: pl.team === 1 ? 2 : 4,
+            point: pl.team === 1 ? 10 : 6,
+        };
+
+        p.writeUInt16LE(c.userId & 0xFFFF,    subOff + 0);    // sub[0..1] userId (lookup zorunlu)
+        p.writeUInt8  (stat.kill   ?? 0,      subOff + 2);    // sub[2] kill
+        p.writeUInt8  (stat.death  ?? 0,      subOff + 3);    // sub[3] death
+        p.writeUInt8  (stat.point  ?? 0,      subOff + 5);    // sub[5] point
+        p.writeUInt32LE(stat.skill1 ?? 1000,  subOff + 16);   // sub[16..19] skill1
+        p.writeUInt16LE(stat.data28 ?? 0,     subOff + 28);   // sub[28..29] data
+        p.writeUInt32LE(stat.skill2 ?? 1000,  subOff + 30);   // sub[30..33] skill2
+    }
+
+    return p;
+}
+
+async function send_SN_Result_GameFinalResult(socket, ctx, room, opts) {
+    await sendPacket(socket, ctx, PKT.SN_Result_GameFinalResult,
+        buildGameFinalResultPayload(room, opts));
 }
 
 async function send_SN_Play_BaseUserList(socket, ctx, room) {
@@ -2045,6 +2213,25 @@ async function processPacket(socket, dec, ctx) {
                 break;
             }
 
+            // NN_Chat_BattleAll (0x220509) / NN_Chat_BattleTeam (0x220507) —
+            // match içinde chat. Client gönderir, lobby odadaki herkese (BattleAll)
+            // veya sadece aynı takıma (BattleTeam) forward eder. Payload format
+            // (canlı dump 2026-04-30): virtualIndex u16 + chat metni + state floats.
+            // Lobby decode etmez, ham payload relay eder.
+            case PKT.NN_Chat_BattleAll:
+            case PKT.NN_Chat_BattleTeam: {
+                const payload = dec.length > 16 ? dec.slice(16) : Buffer.alloc(0);
+                const isTeam = (opcode === PKT.NN_Chat_BattleTeam);
+                if (ctx.roomId) {
+                    console.log(`[LOBBY] ${isTeam ? 'team' : 'battle'}-chat from ${ctx.username} in room ${ctx.roomId} (${payload.length} byte)`);
+                    // TODO: BattleTeam için sadece aynı takım filtrelenmeli (şimdilik herkese gidiyor).
+                    await broadcastRoom(ctx.roomId, opcode, payload);
+                } else {
+                    console.log(`[LOBBY] ${isTeam ? 'team' : 'battle'}-chat ignored: ${ctx.username} not in room`);
+                }
+                break;
+            }
+
             // ============================================================
             // CN_Chat_DevCommand (0x220522) — admin/scmd console komutu.
             // Reverse: GameClient.dll sub_10236700 ("CmdTcpFn <command>").
@@ -2362,10 +2549,58 @@ async function processPacket(socket, dec, ctx) {
                                 console.log(`[LOBBY] DEDI: 0x222213 gönderildi`);
                                 await sendPacket(dediSocket, dediCtx, 0x222121, Buffer.from([0x01, 0x00, 0x01]));
                                 console.log(`[LOBBY] DEDI: 0x222121 gönderildi`);
+
+                                // ★★★ KRİTİK PROMOTION MESAJI — DELAYED ★★★
+                                // 0x230152 = MATCH-START / SPAWN-PROMOTE — GameServer.dll sub_100D28C0 case 2294098.
+                                // Server bu paketi alınca dword_101D9374 (CPlayerObj listesi) için DoRespawn-all loop
+                                // çalıştırır. AMA client UDP→dedi handshake + CPlayerObj creation BU NOKTADA bitmiş
+                                // OLMAZ — paket boş listede dönerdi (canlı debug 2026-04-30 doğrulandı).
+                                //
+                                // FIX: setTimeout ile gecikmeli gönder. Client SN_Hosting_HostConnect alıp
+                                // dedi'ye UDP-handshake yapması (~1-2s) + engine'in OnClientEnterWorld → CreatePlayer
+                                // tamamlaması beklenmeli. 5 saniye güvenli upper bound.
+                                //
+                                // Format: 8 byte sıfır payload (parser a2+16 word + a2+18 dword sıfır check).
+                                setTimeout(async () => {
+                                    try {
+                                        if (dediSocket.destroyed) {
+                                            console.warn(`[LOBBY] DEDI: 0x230152/0x230151 delayed send aborted (dedi socket dropped)`);
+                                            return;
+                                        }
+                                        // 0x230152 = MASS DoRespawn (state=Playing + DoRespawn-all loop)
+                                        await sendPacket(dediSocket, dediCtx, 0x230152, Buffer.alloc(8));
+                                        console.log(`[LOBBY] DEDI: 0x230152 (DELAYED MATCH-START / DoRespawn-all) gönderildi ★`);
+
+                                        // 0x230151 (PER-USER SPAWN) — sub_10058CC0 → RTDynamicCast(CPlayerObj) → vtable[57](team)
+                                        // → sub_100D1CA0(GameState) → sub_100657F0(player, axis, pos, rot) → MID 0xE6/0x0B spawn-at-point.
+                                        // Crash root cause (FIXED via PATCH 3): sub_100D1CA0, config[+0x264] != gameState.vtable[2]()
+                                        // olunca NULL dönüyordu → ebx=0 → [0+24*team+0x1A0] AV → 233MB dump.
+                                        // GameServer.dll'de sub_100D1CA0 setnz cl NOP'landı, daima a1 döner.
+                                        for (const [, pl] of room.players) {
+                                            const pc = clients.get(pl.socket);
+                                            if (!pc || pc.userId == null) continue;
+                                            const vIdx = pc.userId & 0xFFFF;
+                                            const p = Buffer.alloc(2);
+                                            p.writeUInt16LE(vIdx, 0);
+                                            await sendPacket(dediSocket, dediCtx, 0x230151, p);
+                                            console.log(`[LOBBY] DEDI: 0x230151 (PER-USER SPAWN) virtualIndex=0x${vIdx.toString(16)} (${pc.username}) gönderildi ★`);
+                                        }
+                                    } catch (e) {
+                                        console.warn('[LOBBY] delayed 0x230152/0x230151 fail:', e.message);
+                                    }
+                                }, 5000);
+                                console.log(`[LOBBY] DEDI: 0x230152 + 0x230151 5s sonra gönderilecek (client UDP handshake için bekle)`);
                             } catch (e) { console.warn('[LOBBY] dedi spawn-trigger fail:', e.message); }
                         } catch (e) { console.warn('[LOBBY] dedi notify fail:', e.message); }
                     }
                 }
+
+                // SN_GameFinalResult (match-end result screen) BURADA gönderilmemeli —
+                // SN_Hosting_HostConnect'ten ÖNCE gelirse client Result ekranına geçer ve
+                // OnRecvSNHostConnect handler'ı ateşlemez → client dedi'ye UDP atmaz →
+                // OnClientEnterWorld yok → CPlayerObj yaratılmaz → dword_101D9374 boş kalır →
+                // 0x230152 DoRespawn-all loop boş dönüyor → spawn fail (canlı debug 2026-04-30 doğrulandı).
+                // Result screen ayrı bir tetikleyici ile (gerçek match end) gönderilmeli.
 
                 // 2) Gönderene SN_HostConnect (port + ip)
                 const ip   = dediEntry ? dediEntry[1].ip   : '127.0.0.1';
@@ -2383,6 +2618,33 @@ async function processPacket(socket, dec, ctx) {
                     await sendPacket(socket, ctx, PKT.SN_Hosting_BattleStart, bp);
                     room.status = 'playing';
                 }
+
+                // NOT: 0x230104 (SN_Revive), 0x230124 (SN_Kill), 0x220510 (NN_BattleTeamRadio)
+                // gerçek game-event paketleri — periodic heartbeat değil. Bu yüzden burada
+                // tetiklemek YANLIŞ olurdu (her tick "biri kill yaptı" notify'ı atılırdı).
+                // Onlar dedi'den lobby'ye gelir, lobby de match içindeki diğer client'lara relay eder.
+                break;
+            }
+
+            // CN_Play_Ping (0x222141) — D187 client periodic ping triplet (2026-04-30 capture).
+            // Payload: 8B = "03 00 00 00 [4-byte LE timestamp]"
+            // Server cevabı: 0x222142 (30B, timestamp echo) + 0x222143 (6B zeros).
+            // Bizim eski lobby YOKTU; client D187'de bunu gönderiyor, server zamanlama ack veriyor.
+            // Camera bind'le doğrudan alaka belirsiz ama ping cevabı vermek iyi davranış.
+            case PKT.CN_Play_Ping: {
+                const payload = dec.slice(16);
+                const tag = payload.readUInt32LE(0);          // 0x00000003
+                const ts  = payload.readUInt32LE(4);          // client timestamp
+                console.log(`[LOBBY] CN_Play_Ping ${ctx.username} tag=0x${tag.toString(16)} ts=0x${ts.toString(16)}`);
+
+                // 0x222142 — 30B payload echoes timestamp at offset 10
+                const ack = Buffer.alloc(30);
+                ack.writeUInt32LE(tag, 0);
+                ack.writeUInt32LE(ts,  10);
+                await sendPacket(socket, ctx, PKT.SA_Play_Ping, ack);
+
+                // 0x222143 — 6B zeros (basit ack)
+                await sendPacket(socket, ctx, PKT.SN_Play_PingExtra, Buffer.alloc(6));
                 break;
             }
 
@@ -2458,63 +2720,85 @@ async function processPacket(socket, dec, ctx) {
                 handleDedicatedConnect(socket, ctx, dec);
                 break;
 
-            // CN_TheRawServer_Notify (0x420208) — payload genelde 2 byte (virtualUserIndex
-            // veya FF 00). Echo geri yollanması ESKİ ÇALIŞAN davranıştı; sessiz kabul
-            // BAN'a yol açıyor — geri ekledik.
-            case PKT.CN_TheRawServer_Notify: {
-                const payload = dec.slice(16);
-                console.log(`[DEDI] CN_TheRawServer_Notify (${payload.length} byte): ${payload.toString('hex')}`);
-                await sendPacket(socket, ctx, PKT.CN_TheRawServer_Notify, payload);
+            // ============================================================
+            // dedi → lobby notification handlers (deep reverse 2026-04-30).
+            // Tüm 0x42xxxx paketleri TheRawServer'dan geliyor — her birinin
+            // formatı GameServer.dll içinde reverse'lendi.
+            // ============================================================
+
+            // 0x420203 — handshake sonrası ilk "ready" sinyali (16 byte = sadece header).
+            // Builder: GameServer.dll sub_100D1FA0 (mov [ecx+0Ch], 420203h; mov [ecx+6], 16).
+            // Lobby tarafı: sadece log, payload yok, cevap yok.
+            case PKT.SN_TheRawServer_HandshakeAck: {  // = 0x420203
+                console.log(`[DEDI→lobby] HandshakeAck (0x420203) — ready signal`);
                 break;
             }
 
-            // CN_TheRawServer_ClientAdded (0x420105) — TheRawServer'dan gelen
-            // "client X başarıyla bağlandı" notification.
-            // Reverse: GameServer.dll CheckConnectCompleteAndSendHermit (sub_10085F70)
-            //   payload[8] u16 = wVirtualUserIndex (lobby'nin atadığı user index)
-            // Lobby şimdilik sadece logluyor — gerçek davranışta bu user'ı
-            // "InGame" state'ine geçirmeli + diğer client'lara duyurmalı.
-            case PKT.CN_TheRawServer_ClientAdded: {
+            // 0x420205 — state=Playing achieved + virtualIndex (18 byte).
+            // Builder: 0x10083655/3b32/8553d/85fc3 (4 farklı yer, kullanım context'ine göre).
+            // Format: payload[0..1] u16 virtualIndex (LE).
+            // Canlı debug 2026-04-30: 0x230152 (DoRespawn-all) işlendikten ve state=Playing
+            // (sub_100CCA10(state=4)) set olduktan sonra dedi bu paketi yolluyor.
+            case PKT.SN_TheRawServer_StatePlaying: {  // = 0x420205
                 const payload = dec.slice(16);
-                const userIdx = payload.length >= 2 ? payload.readUInt16BE(0) : -1;
-                console.log(`[DEDI] CN_TheRawServer_ClientAdded wVirtualUserIndex=${userIdx} payload=${payload.toString('hex')}`);
+                const vIdx = payload.length >= 2 ? payload.readUInt16LE(0) : -1;
+                console.log(`[DEDI→lobby] StatePlaying (0x420205) virtualIndex=0x${vIdx.toString(16)} → server state=Playing`);
                 break;
             }
 
-            // SN_RoundStart (0x230151) — GameServer.dll sub_100CC2E0 = "SendHermitRoundStart".
-            // Dedi state machine state 3 → 4 (Playing) geçişinde 20 byte (16 header +
-            // 4 byte zero payload) yolluyor. Bu, dedi'nin "round'a başlıyorum" notify'ı.
-            // Echo back YANLIŞ davranıştı (dedi state machine kendi içinde ilerletiyor).
-            // Şimdilik sessiz kabul; ileride gerekirse lobby'nin başka cevap vermesi
-            // gerektiği netleşince güncellenir.
-            // SN_RoundStart (0x230151) — eski çalışan davranış: ECHO back. Echo
-            // kaldırılınca dedi state machine ilerlemiyor, BAN.
-            case PKT.SN_RoundStart: {
+            // 0x420206 — handshake sonrası 2. ready sinyali + virtualIndex (18 byte).
+            // Builder: 0x10083685/3b52/847b1.
+            // Format: payload[0..1] u16 virtualIndex (LE).
+            case PKT.SN_TheRawServer_HandshakeAck2: {  // = 0x420206
                 const payload = dec.slice(16);
-                console.log(`[DEDI] SN_RoundStart (${payload.length} byte): ${payload.toString('hex')}`);
-                await sendPacket(socket, ctx, PKT.SN_RoundStart, payload);
+                const vIdx = payload.length >= 2 ? payload.readUInt16LE(0) : -1;
+                console.log(`[DEDI→lobby] HandshakeAck2 (0x420206) virtualIndex=0x${vIdx.toString(16)}`);
                 break;
             }
 
-            // CN_TheRawServer_UserRemoved (0x420205) — dedi'den oyuncu disconnect
-            // olunca yolluyor. Reverse: sub_10085520 builder, payload[0..1]=virtualUserIndex (LE).
-            // Sonra sub_100845C0 lookup + sub_100D2810 dispatcher case 0x420207 ile
-            // "SN_NotExistUser"/"SN_UserExit" notify ediyor.
-            case PKT.CN_TheRawServer_UserRemoved: {
+            // 0x420208 — generic per-user notification (18 byte).
+            // Builder: sub_10083630 (mov [eax+0Ch], 420208h; mov [eax+6], 18).
+            // Format: payload[0..1] u16 virtualIndex (LE).
+            // Eski davranış: echo back. Sessiz bırakınca BAN — echo gerekli.
+            case PKT.SN_TheRawServer_Notify: {  // = 0x420208
                 const payload = dec.slice(16);
-                const idx = payload.length >= 2 ? payload.readUInt16LE(0) : -1;
-                console.log(`[DEDI] UserRemoved virtualUserIndex=0x${idx.toString(16)} (${payload.toString('hex')})`);
+                const vIdx = payload.length >= 2 ? payload.readUInt16LE(0) : -1;
+                console.log(`[DEDI→lobby] Notify (0x420208) virtualIndex=0x${vIdx.toString(16)} — echo back`);
+                await sendPacket(socket, ctx, PKT.SN_TheRawServer_Notify, payload);
                 break;
             }
 
-            // CN_TheRawServer_Ready1/2/3 (0x420203/04/06) — TheRawServer post-handshake
-            // notification'lar (handshake sonrası "ready" sinyalleri tahmini). Şimdilik
-            // sessiz kabul — lobby'nin ne göndermesi gerektiği netleşince ack ekleriz.
-            case PKT.CN_TheRawServer_Ready1:
-            case PKT.CN_TheRawServer_Ready2:
-            case PKT.CN_TheRawServer_Ready3: {
+            // 0x230103 — dedi engine task: DoRespawn notification (19 byte).
+            // Builder: sub_100CC270 (DoRespawn) — engine task queue'ya enqueue edilen
+            // spawn task'ın broadcast'ı. Lobby'ye TCP üzerinden bildirim olarak ulaşıyor.
+            // Format: packet[0xC]=0x230103, packet[6]=19, packet[0x10..0x11]=u16 virtualIndex,
+            //         packet[0x12]=u8 doRespawnFlag (0 normal, 1 SN_Revive).
+            // Reverse: sub_100CC270 disasm onaylı (operator new(0x400) → set fields → enqueue).
+            // Lobby: sadece log, cevap yok (engine task'ı sürdürür).
+            case PKT.SN_TheRawServer_DoRespawnTask: {  // = 0x230103
                 const payload = dec.slice(16);
-                console.log(`[DEDI] notify 0x${opcode.toString(16)} ${PKT_ALL.NAME(opcode)} (${payload.length} byte): ${payload.toString('hex')}`);
+                const vIdx = payload.length >= 2 ? payload.readUInt16LE(0) : -1;
+                const flag = payload.length >= 3 ? payload[2] : -1;
+                console.log(`[DEDI→lobby] DoRespawnTask (0x230103) virtualIndex=0x${vIdx.toString(16)} flag=${flag} — engine task queued`);
+                break;
+            }
+
+            // 0x230151 — dedi case 2294097 (sub_10058CC0) — SN_RoundStart per-user.
+            // Bu opcode normalde lobby → dedi yönünde GIDIYOR. Eğer dedi'den lobby'ye
+            // GELIRSE bu bir relay/echo (yan etki). Sessiz log yeterli.
+            case PKT.SN_RoundStart: {  // = 0x230151
+                const payload = dec.slice(16);
+                console.log(`[DEDI→lobby] SN_RoundStart (0x230151) ${payload.length}B: ${payload.toString('hex')}`);
+                break;
+            }
+
+            // 0x230111 — dedi → lobby: RoundEnd (state=5=EndingRound) notify.
+            // Reverse: sub_100CD7D0 — round timer expire / "Host EServerGameState_EndingRound".
+            // Format: 16 byte sadece header, payload yok.
+            // Bizim için ÖNEMLİ İŞARET: bu paket gelirse dedi round'u bitirmiş demek
+            // → spawn time penceresi kapanmış olabilir. ⚠
+            case PKT.SN_TheRawServer_RoundEnd: {  // = 0x230111
+                console.log(`[DEDI→lobby] ⚠ RoundEnd (0x230111) — dedi state=EndingRound, round timer expired`);
                 break;
             }
 
